@@ -1,7 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
-import fnmatch
 
 # ASCII characters
 BRANCH = "|-- "
@@ -24,16 +23,6 @@ class FolderTreeGenerator:
             size /= 1024
         return f"{size:.1f} PB"
 
-    def parse_patterns(self, text):
-        """Parse comma-separated pattern string into a list."""
-        if not text:
-            return []
-        return [p.strip() for p in text.split(",") if p.strip()]
-
-    def matches_any(self, name, patterns):
-        """Return True if name matches any of the given glob patterns."""
-        return any(fnmatch.fnmatch(name, p) for p in patterns)
-
     def walk(
         self,
         folder,
@@ -42,42 +31,22 @@ class FolderTreeGenerator:
         max_depth=None,
         show_hidden=False,
         show_sizes=False,
-        exclude_patterns=None,
-        include_patterns=None,
     ):
         if max_depth is not None and depth > max_depth:
             return
 
-        exclude_patterns = exclude_patterns or []
-        include_patterns = include_patterns or []
-
         try:
-            all_entries = [
-                e
-                for e in folder.iterdir()
-                if show_hidden or not e.name.startswith(".")
-            ]
+            entries = sorted(
+                [
+                    e
+                    for e in folder.iterdir()
+                    if show_hidden or not e.name.startswith(".")
+                ],
+                key=lambda x: (x.is_file(), x.name.lower()),
+            )
         except PermissionError:
             self.lines.append(prefix + "[Permission Denied]")
             return
-
-        # Filter entries based on exclude and include patterns
-        filtered = []
-        for entry in all_entries:
-            # Exclude takes priority - skip anything matching exclude
-            if self.matches_any(entry.name, exclude_patterns):
-                continue
-            # Include patterns only apply to files (directories kept for structure)
-            if entry.is_file() and include_patterns and not self.matches_any(
-                entry.name, include_patterns
-            ):
-                continue
-            filtered.append(entry)
-
-        entries = sorted(
-            filtered,
-            key=lambda x: (x.is_file(), x.name.lower()),
-        )
 
         for i, entry in enumerate(entries):
             last = i == len(entries) - 1
@@ -93,8 +62,6 @@ class FolderTreeGenerator:
                     max_depth,
                     show_hidden,
                     show_sizes,
-                    exclude_patterns,
-                    include_patterns,
                 )
             else:
                 text = entry.name
@@ -114,8 +81,6 @@ class FolderTreeGenerator:
         max_depth=None,
         show_hidden=False,
         show_sizes=False,
-        exclude_patterns=None,
-        include_patterns=None,
     ):
         self.lines = [str(root)]
         self.walk(
@@ -125,8 +90,6 @@ class FolderTreeGenerator:
             max_depth,
             show_hidden,
             show_sizes,
-            exclude_patterns,
-            include_patterns,
         )
         return "\n".join(self.lines)
 
@@ -136,7 +99,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Folder Structure Generator")
-        self.root.geometry("1000x750")
+        self.root.geometry("1000x700")
 
         self.generator = FolderTreeGenerator()
 
@@ -145,20 +108,17 @@ class App:
 
         self.folder_var = tk.StringVar()
 
-        ttk.Label(top, text="Folder:").pack(side="left")
-
         ttk.Entry(
             top,
             textvariable=self.folder_var,
-        ).pack(side="left", fill="x", expand=True, padx=5)
+        ).pack(side="left", fill="x", expand=True)
 
         ttk.Button(
             top,
             text="Browse",
             command=self.browse,
-        ).pack(side="left")
+        ).pack(side="left", padx=5)
 
-        # Options row
         options = ttk.Frame(root)
         options.pack(fill="x", padx=10)
 
@@ -186,38 +146,6 @@ class App:
             width=6,
         ).pack(side="left")
 
-        # Filter row - Exclude patterns
-        filter_frame = ttk.Frame(root)
-        filter_frame.pack(fill="x", padx=10, pady=(10, 0))
-
-        ttk.Label(filter_frame, text="Exclude:").pack(side="left")
-        self.exclude_var = tk.StringVar()
-        ttk.Entry(
-            filter_frame,
-            textvariable=self.exclude_var,
-        ).pack(side="left", fill="x", expand=True, padx=5)
-        ttk.Label(
-            filter_frame,
-            text="(e.g. *.pyc, __pycache__, .git)",
-            foreground="gray",
-        ).pack(side="left")
-
-        # Filter row - Include patterns
-        include_frame = ttk.Frame(root)
-        include_frame.pack(fill="x", padx=10, pady=(5, 0))
-
-        ttk.Label(include_frame, text="Include only:").pack(side="left")
-        self.include_var = tk.StringVar()
-        ttk.Entry(
-            include_frame,
-            textvariable=self.include_var,
-        ).pack(side="left", fill="x", expand=True, padx=5)
-        ttk.Label(
-            include_frame,
-            text="(e.g. *.py, *.txt) - leave empty to show all",
-            foreground="gray",
-        ).pack(side="left")
-
         buttons = ttk.Frame(root)
         buttons.pack(fill="x", padx=10, pady=5)
 
@@ -239,12 +167,6 @@ class App:
             command=self.copy,
         ).pack(side="left")
 
-        ttk.Button(
-            buttons,
-            text="Clear Filters",
-            command=self.clear_filters,
-        ).pack(side="left", padx=5)
-
         self.text = tk.Text(
             root,
             wrap="none",
@@ -262,13 +184,6 @@ class App:
         folder = filedialog.askdirectory()
         if folder:
             self.folder_var.set(folder)
-
-    def clear_filters(self):
-        self.exclude_var.set("")
-        self.include_var.set("")
-        self.depth.set("")
-        self.hidden.set(False)
-        self.sizes.set(False)
 
     def generate(self):
         folder = self.folder_var.get()
@@ -300,20 +215,11 @@ class App:
                 )
                 return
 
-        exclude_patterns = self.generator.parse_patterns(
-            self.exclude_var.get()
-        )
-        include_patterns = self.generator.parse_patterns(
-            self.include_var.get()
-        )
-
         tree = self.generator.generate(
             path,
             max_depth=depth,
             show_hidden=self.hidden.get(),
             show_sizes=self.sizes.get(),
-            exclude_patterns=exclude_patterns,
-            include_patterns=include_patterns,
         )
 
         self.text.delete("1.0", tk.END)
