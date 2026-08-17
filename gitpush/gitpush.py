@@ -10,8 +10,9 @@ class GitRepoCreatorApp:
     """
     GUI app that walks through subfolders of a chosen parent folder:
       - If a subfolder has no .git, it creates a new GitHub repo via `gh` and pushes.
-      - If a subfolder already has .git, it commits (if needed), pulls (merging), and pushes.
-    Handles missing remotes and unrelated histories gracefully.
+      - If a subfolder already has .git, it commits (if needed), pulls (merging), 
+        resolves any conflicts in favor of local files, and pushes.
+    Handles missing remotes, unrelated histories, and push rejections gracefully.
     """
 
     def __init__(self, root):
@@ -240,6 +241,10 @@ class GitRepoCreatorApp:
             return False
 
     def _update_existing_repo(self, sf, gh_name, commit_msg, visibility):
+        # 0. Clean up any leftover merge/rebase state from a previous run
+        self.run_cmd(["git", "merge", "--abort"], sf)
+        self.run_cmd(["git", "rebase", "--abort"], sf)
+
         # 1. Check if remote 'origin' exists
         ok, out = self.run_cmd(["git", "remote"], sf)
         remotes = out.strip().split()
@@ -256,23 +261,24 @@ class GitRepoCreatorApp:
                 if "already exists" in err.lower() or "already a repository" in err.lower():
                     self._log(f"  · GitHub repo '{gh_name}' already exists. Fetching URL and adding remote...", "info")
                     ok_url, url_out = self.run_cmd(["gh", "repo", "view", gh_name, "--json", "url"], sf)
-                    if ok_url:
-                        try:
-                            repo_url = json.loads(url_out).get("url")
-                            if repo_url:
-                                if not repo_url.endswith(".git"):
-                                    repo_url += ".git"
-                                self.run_cmd(["git", "remote", "add", "origin", repo_url], sf)
-                                self._log(f"  · Added 'origin' remote pointing to {repo_url}.", "info")
-                            else:
-                                self._log(f"  ✗ Failed to parse repo URL.", "fail")
-                                return False
-                        except Exception:
-                            self._log(f"  ✗ Failed to parse repo URL: {url_out}", "fail")
-                            return False
-                    else:
+                    if not ok_url:
                         self._log(f"  ✗ Failed to get repo URL for '{gh_name}': {url_out.strip()}", "fail")
                         return False
+                    try:
+                        repo_url = json.loads(url_out).get("url")
+                    except Exception:
+                        self._log(f"  ✗ Failed to parse repo URL: {url_out}", "fail")
+                        return False
+                        
+                    if not repo_url:
+                        self._log("  ✗ Empty repo URL.", "fail")
+                        return False
+                        
+                    if not repo_url.endswith(".git"):
+                        repo_url += ".git"
+                        
+                    self.run_cmd(["git", "remote", "add", "origin", repo_url], sf)
+                    self._log(f"  · Added 'origin' remote → {repo_url}.", "info")
                 else:
                     self._log(f"  ✗ gh repo create failed: {err.strip()}", "fail")
                     return False
@@ -292,28 +298,64 @@ class GitRepoCreatorApp:
         else:
             self._log(f"  ! git commit warning: {err.strip()}", "warn")
 
-        # 4. git pull (to handle "fetch first" push rejection) - NO REBASE
+        # 4. git pull (to handle "fetch first" push rejection) with smart conflict resolution
         self._log(f"  · Syncing with remote to prevent push rejections...", "info")
-        ok, err = self.run_cmd(["git", "pull", "origin", "HEAD", "--no-edit"], sf)
-        if not ok:
-            if "couldn't find remote ref" in err.lower() or "no tracking information" in err.lower():
-                self._log(f"  · Remote is empty or missing HEAD, proceeding to push.", "info")
-            elif "refusing to merge unrelated histories" in err.lower():
-                # Fall back to allowing unrelated histories if standard merge failed
+        pull_ok, pull_err = self.run_cmd(["git", "pull", "origin", "HEAD", "--no-edit"], sf)
+
+        if not pull_ok:
+            low = pull_err.lower()
+            if "refusing to merge unrelated histories" in low:
                 self._log(f"  · Unrelated histories detected. Attempting merge...", "info")
-                ok2, err2 = self.run_cmd(["git", "pull", "origin", "HEAD", "--allow-unrelated-histories", "--no-edit"], sf)
-                if not ok2:
-                    if "couldn't find remote ref" in err2.lower() or "no tracking information" in err2.lower():
-                        self._log(f"  · Remote is empty or missing HEAD, proceeding to push.", "info")
-                    else:
-                        self._log(f"  ! git pull warning: {err2.strip()}", "warn")
-            else:
-                self._log(f"  ! git pull warning: {err.strip()}", "warn")
+                pull_ok, pull_err = self.run_cmd(
+                    ["git", "pull", "origin", "HEAD", "--allow-unrelated-histories", "--no-edit"], sf
+                )
+                low = pull_err.lower()
+
+            if not pull_ok:
+                # Detect conflicted files
+                cf_ok, cf_out = self.run_cmd(["git", "diff", "--name-only", "--diff-filter=U"], sf)
+                conflicted = [l for l in cf_out.splitlines() if l.strip()] if cf_ok else []
+
+                if conflicted:
+                    self._log(f"  ! Merge conflicts in {len(conflicted)} file(s):", "warn")
+                    for f in conflicted[:8]:
+                        self._log(f"      • {f}", "warn")
+                    if len(conflicted) > 8:
+                        self._log(f"      … and {len(conflicted) - 8} more", "warn")
+
+                    # Resolve: prefer LOCAL (--ours). This is the right default when
+                    # you're uploading your local work to a remote that already had content.
+                    self._log("  · Resolving conflicts in favor of LOCAL (--ours)...", "info")
+                    # `checkout --ours` works only for paths with conflicts; pass them explicitly
+                    self.run_cmd(["git", "checkout", "--ours", "--"] + conflicted, sf)
+                    self.run_cmd(["git", "add", "-A"], sf)
+                    
+                    ok_c, err_c = self.run_cmd(
+                        ["git", "commit", "--no-edit", "-m", "Merge remote (conflicts resolved: prefer local)"], sf
+                    )
+                    if not ok_c:
+                        self._log(f"  ! Conflict-resolution commit warning: {err_c.strip()}", "warn")
+                        # As a last resort, abort and let the push path decide
+                        self.run_cmd(["git", "merge", "--abort"], sf)
+
+                elif "couldn't find remote ref" in low or "no tracking information" in low:
+                    self._log(f"  · Remote is empty or missing HEAD, proceeding to push.", "info")
+                else:
+                    self._log(f"  ! git pull warning: {pull_err.strip()}", "warn")
+                    self.run_cmd(["git", "merge", "--abort"], sf)
 
         # 5. git push -u origin HEAD
         ok, err = self.run_cmd(["git", "push", "-u", "origin", "HEAD"], sf)
         if ok:
             self._log(f"  ✓ Pushed existing repo.", "success")
+            return True
+
+        # 6. Last-resort: safe force push (only overwrites if remote is unchanged
+        #    since our last fetch — protects against clobbering others' work).
+        self._log(f"  · Push rejected. Trying --force-with-lease...", "warn")
+        ok, err = self.run_cmd(["git", "push", "-u", "--force-with-lease", "origin", "HEAD"], sf)
+        if ok:
+            self._log(f"  ✓ Force-pushed (with lease).", "success")
             return True
 
         self._log(f"  ✗ git push failed: {err.strip()}", "fail")
