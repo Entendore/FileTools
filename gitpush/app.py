@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QPlainTextEdit,
-    QProgressBar, QGroupBox, QFileDialog, QMessageBox, QScrollArea, QTextEdit
+    QProgressBar, QGroupBox, QFileDialog, QMessageBox, QScrollArea, QTextEdit, QSplitter
 )
 from PySide6.QtCore import Qt, QObject, Signal, QTimer
 from PySide6.QtGui import QFont, QColor, QTextCursor
@@ -34,6 +34,7 @@ class WorkerSignals(QObject):
     repo_start_signal = Signal(str)
     repo_done_signal = Signal(str, bool)
     thread_progress_signal = Signal(int, str, str, int, str)
+    flush_log_signal = Signal(str)
 
 
 class ThreadProgressRow(QWidget):
@@ -97,12 +98,12 @@ class ThreadProgressRow(QWidget):
 
 class GitRepoCreatorApp(QMainWindow):
     """
-    Git Repo Creator / Updater v6.8 (PySide6)
+    Git Repo Creator / Updater v7.0 (PySide6)
     
-    ★ CRITICAL FIX: Completely rewritten _squash_and_push to use Git's native 
-    "orphan branch" technique. This safely squashes history into 1 commit while 
-    preserving the remote link, preventing infinite recursion bugs, and avoiding 
-    the destructive ".git folder deletion" method.
+    ★ MAJOR UI OVERHAUL: Modern split-pane layout (Settings Left, Monitoring Right)
+    - Horizontal QSplitter for optimal wide-screen usage
+    - Scrollable thread progress panel to prevent log window from being pushed off-screen
+    - Integrated all previous fixes: sanitize repo names, orphan branch squash, keep untracked files, f-string fixes.
     """
 
     EXCLUDE_FOLDERS: Set[str] = {"input", "output", "temp", "venv", ".venv", "__pycache__",
@@ -140,8 +141,8 @@ class GitRepoCreatorApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Git Repo Creator / Updater v6.8 (PySide6)")
-        self.resize(1100, 950)
+        self.setWindowTitle("Git Repo Creator / Updater v7.0")
+        self.resize(1200, 800)
 
         self.logger = logging.getLogger("GitRepoCreator")
         self.logger.setLevel(logging.INFO)
@@ -156,6 +157,8 @@ class GitRepoCreatorApp(QMainWindow):
         self.signals.repo_start_signal.connect(self.on_repo_start)
         self.signals.repo_done_signal.connect(self.on_repo_done)
         self.signals.thread_progress_signal.connect(self.update_thread_progress)
+        self._repo_log_buffers: Dict[str, List[Tuple[str, str, str]]] = {}
+        self._repo_log_lock = threading.Lock()
 
         self.running = False
         self.cancelled = False
@@ -220,15 +223,37 @@ class GitRepoCreatorApp(QMainWindow):
     def _build_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        
+        # ★ MAIN LAYOUT: Horizontal Splitter (Left: Settings, Right: Monitoring)
+        main_layout = QHBoxLayout(centralWidget := central_widget)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+        
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(splitter)
+
+        # ==========================================
+        # LEFT PANEL: Configuration & Settings
+        # ==========================================
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout(scroll_widget)
+        scroll_layout.setSpacing(16)
 
-        basic_group = QGroupBox("Basic Settings")
+        # 1. Basic Settings
+        basic_group = QGroupBox("⚙️ Basic Settings")
+        basic_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #3c3c3c; border-radius: 6px; margin-top: 12px; padding-top: 12px; }")
         basic_layout = QGridLayout()
+        basic_layout.setVerticalSpacing(8)
+        basic_layout.setHorizontalSpacing(8)
+        
         self.folder_edit = QLineEdit()
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self.browse_folder)
@@ -267,8 +292,13 @@ class GitRepoCreatorApp(QMainWindow):
         basic_group.setLayout(basic_layout)
         scroll_layout.addWidget(basic_group)
 
-        opts_group = QGroupBox("Options")
+        # 2. Options
+        opts_group = QGroupBox("🛠️ Options")
+        opts_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #3c3c3c; border-radius: 6px; margin-top: 12px; padding-top: 12px; }")
         opts_layout = QGridLayout()
+        opts_layout.setVerticalSpacing(8)
+        opts_layout.setHorizontalSpacing(8)
+        
         self.dry_run_check = QCheckBox("Dry-Run (preview only)")
         self.auto_readme_check = QCheckBox("Auto README.md")
         self.auto_readme_check.setChecked(True)
@@ -278,17 +308,35 @@ class GitRepoCreatorApp(QMainWindow):
         self.squash_check = QCheckBox("Squash history into 1 single commit")
         self.squash_check.setStyleSheet("color: #f44747; font-weight: bold;")
         self.surgical_check = QCheckBox("Surgical history removal (requires 'git-filter-repo')")
+        self.keep_untracked_check = QCheckBox("Keep untracked files on local disk (only remove from Git)")
+        self.keep_untracked_check.setToolTip("Files matching cleanup filters will be untracked from Git but NOT deleted from your hard drive.")
+
         opts_layout.addWidget(self.dry_run_check, 0, 0)
         opts_layout.addWidget(self.auto_readme_check, 0, 1)
         opts_layout.addWidget(self.auto_license_check, 0, 2)
         opts_layout.addWidget(self.show_log_check, 1, 0)
         opts_layout.addWidget(self.squash_check, 1, 1)
         opts_layout.addWidget(self.surgical_check, 1, 2)
+        opts_layout.addWidget(self.keep_untracked_check, 2, 0, 1, 3)
+
+        self.remove_workflows_check = QCheckBox("Remove GitHub Actions workflows (.github/workflows)")
+        self.remove_workflows_check.setToolTip("Deletes all GitHub Actions workflow files and the .github directory. Useful for repos with broken or outdated CI/CD pipelines.")
+        opts_layout.addWidget(self.remove_workflows_check, 3, 0, 1, 3)
+
+        self.reset_on_start_check = QCheckBox("🔄 Reset progress on Start (redo everything from scratch)")
+        self.reset_on_start_check.setToolTip("When checked, pressing Start will delete the saved progress file and reprocess ALL repositories, even those already completed.")
+        self.reset_on_start_check.setStyleSheet("color: #e3b341; font-weight: bold;")
+        opts_layout.addWidget(self.reset_on_start_check, 4, 0, 1, 3)
+
         opts_group.setLayout(opts_layout)
         scroll_layout.addWidget(opts_group)
 
-        cleanup_group = QGroupBox("Advanced Cleanup Filters")
+        # 3. Advanced Cleanup Filters (3-Column Grid)
+        cleanup_group = QGroupBox("🧹 Advanced Cleanup Filters")
+        cleanup_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #3c3c3c; border-radius: 6px; margin-top: 12px; padding-top: 12px; }")
         cleanup_layout = QGridLayout()
+        cleanup_layout.setVerticalSpacing(8)
+        cleanup_layout.setHorizontalSpacing(8)
         
         cleanup_layout.addWidget(QLabel("Extensions to remove from Git history:"), 0, 0)
         self.extensions_edit = QPlainTextEdit()
@@ -297,11 +345,11 @@ class GitRepoCreatorApp(QMainWindow):
         self.extensions_edit.setToolTip("These patterns will be removed from Git history. Use wildcards like *.bin")
         cleanup_layout.addWidget(self.extensions_edit, 1, 0)
         
-        cleanup_layout.addWidget(QLabel("Media/Archive/AI files to untrack & delete locally:"), 0, 1)
+        cleanup_layout.addWidget(QLabel("Media/Archive/AI files to untrack:"), 0, 1)
         self.media_exts_edit = QPlainTextEdit()
         self.media_exts_edit.setPlainText("\n".join(sorted(list(self.DEFAULT_MEDIA_EXTS))))
         self.media_exts_edit.setMaximumHeight(150)
-        self.media_exts_edit.setToolTip("These files will be untracked and deleted locally to prevent >100MB GitHub push rejections.")
+        self.media_exts_edit.setToolTip("These files will be untracked to prevent >100MB GitHub push rejections.")
         cleanup_layout.addWidget(self.media_exts_edit, 1, 1)
         
         cleanup_layout.addWidget(QLabel("Directories to remove completely:"), 0, 2)
@@ -314,33 +362,45 @@ class GitRepoCreatorApp(QMainWindow):
         cleanup_layout.setColumnStretch(0, 1)
         cleanup_layout.setColumnStretch(1, 1)
         cleanup_layout.setColumnStretch(2, 1)
-        
         cleanup_group.setLayout(cleanup_layout)
         scroll_layout.addWidget(cleanup_group)
 
+        scroll_layout.addStretch()
         scroll.setWidget(scroll_widget)
-        main_layout.addWidget(scroll)
+        left_layout.addWidget(scroll)
 
+        # ==========================================
+        # RIGHT PANEL: Execution & Monitoring
+        # ==========================================
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
+
+        # 1. Action Buttons
         btn_layout = QHBoxLayout()
-        self.start_btn = QPushButton("▶ Start")
-        self.start_btn.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 6px;")
+        self.start_btn = QPushButton("▶ Start Processing")
+        self.start_btn.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 8px; border-radius: 4px;")
         self.start_btn.clicked.connect(self.start_processing)
+        
         self.cancel_btn = QPushButton("■ Cancel")
         self.cancel_btn.setEnabled(False)
-        self.cancel_btn.setStyleSheet("background-color: #d73a49; color: white; padding: 6px;")
+        self.cancel_btn.setStyleSheet("background-color: #d73a49; color: white; font-weight: bold; padding: 8px; border-radius: 4px;")
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
+        
         self.force_quit_btn = QPushButton("⚠ Force Quit")
-        self.force_quit_btn.setStyleSheet("background-color: #721c24; color: white; font-weight: bold; padding: 6px;")
+        self.force_quit_btn.setStyleSheet("background-color: #721c24; color: white; font-weight: bold; padding: 8px; border-radius: 4px;")
         self.force_quit_btn.setVisible(False)
         self.force_quit_btn.clicked.connect(self.force_quit)
-        self.reset_btn = QPushButton("Reset Progress")
-        self.reset_btn.clicked.connect(self.reset_progress)
-        self.cleanup_btn = QPushButton("Force Cleanup .git")
-        self.cleanup_btn.setStyleSheet("background-color: #e3b341; padding: 6px;")
-        self.cleanup_btn.clicked.connect(self.force_cleanup_git_folders)
-        self.log_btn = QPushButton("Open Log")
+
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addWidget(self.force_quit_btn)
+        btn_layout.addStretch()
+        
+        self.log_btn = QPushButton("Open Log File")
         self.log_btn.clicked.connect(self.open_log_file)
-        self.global_progress_btn = QPushButton("📊 View Global Progress")
+        self.global_progress_btn = QPushButton("📊 Global Progress")
         self.global_progress_btn.clicked.connect(self.open_global_progress)
         self.clear_btn = QPushButton("Clear Log")
         self.clear_btn.clicked.connect(self.clear_log)
@@ -348,76 +408,113 @@ class GitRepoCreatorApp(QMainWindow):
         self.report_btn.setEnabled(False)
         self.report_btn.clicked.connect(self.export_report)
 
-        for btn in [self.start_btn, self.cancel_btn, self.force_quit_btn, self.reset_btn, self.cleanup_btn, self.log_btn, self.global_progress_btn, self.clear_btn, self.report_btn]:
+        for btn in [self.log_btn, self.global_progress_btn, self.clear_btn, self.report_btn]:
             btn_layout.addWidget(btn)
-        btn_layout.addStretch()
-        main_layout.addLayout(btn_layout)
+        right_layout.addLayout(btn_layout)
 
-        progress_group = QGroupBox("Overall Progress")
-        progress_group.setStyleSheet("QGroupBox { font-weight: bold; color: #d4d4d4; border: 1px solid #3c3c3c; border-radius: 6px; margin-top: 10px; padding-top: 16px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
+        # 2. Overall Progress
+        progress_group = QGroupBox("📦 Overall Progress")
+        progress_group.setStyleSheet("QGroupBox { font-weight: bold; color: #d4d4d4; border: 1px solid #3c3c3c; border-radius: 6px; margin-top: 4px; padding-top: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
         progress_layout = QVBoxLayout()
-        progress_layout.addWidget(QLabel("📦 Repositories", styleSheet="color: #569cd6; font-weight: bold; font-size: 12px;"))
+        
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFixedHeight(28)
+        self.progress_bar.setFixedHeight(24)
         self.progress_bar.setStyleSheet(self._progress_bar_style("#2ea043"))
         progress_layout.addWidget(self.progress_bar)
+        
         self.progress_label = QLabel("Ready.")
         self.progress_label.setStyleSheet("color: #808080; font-size: 11px; padding: 2px 0;")
         progress_layout.addWidget(self.progress_label)
-        progress_layout.addWidget(QLabel("⚙️ Current Operation (Overall)", styleSheet="color: #ce9178; font-weight: bold; font-size: 12px; margin-top: 6px;"))
+        
         self.step_progress_bar = QProgressBar()
         self.step_progress_bar.setRange(0, 100)
         self.step_progress_bar.setValue(0)
         self.step_progress_bar.setTextVisible(True)
-        self.step_progress_bar.setFixedHeight(22)
+        self.step_progress_bar.setFixedHeight(20)
         self.step_progress_bar.setStyleSheet(self._progress_bar_style("#569cd6"))
         progress_layout.addWidget(self.step_progress_bar)
+        
         self.step_label = QLabel("Idle")
         self.step_label.setStyleSheet("color: #808080; font-size: 11px; padding: 2px 0;")
         progress_layout.addWidget(self.step_label)
 
         stats_row = QHBoxLayout()
-        self.stat_created = QLabel("✅ 0"); self.stat_created.setStyleSheet("color: #4ec9b0; font-weight: bold; font-size: 12px;"); stats_row.addWidget(self.stat_created)
-        self.stat_updated = QLabel("🔄 0"); self.stat_updated.setStyleSheet("color: #569cd6; font-weight: bold; font-size: 12px;"); stats_row.addWidget(self.stat_updated)
-        self.stat_failed = QLabel("❌ 0"); self.stat_failed.setStyleSheet("color: #f44747; font-weight: bold; font-size: 12px;"); stats_row.addWidget(self.stat_failed)
-        self.stat_deferred = QLabel("⏳ 0"); self.stat_deferred.setStyleSheet("color: #e3b341; font-weight: bold; font-size: 12px;"); stats_row.addWidget(self.stat_deferred)
-        self.stat_skipped = QLabel("⏭️ 0"); self.stat_skipped.setStyleSheet("color: #808080; font-weight: bold; font-size: 12px;"); stats_row.addWidget(self.stat_skipped)
-        self.stat_cleaned = QLabel("🧹 0 files"); self.stat_cleaned.setStyleSheet("color: #c586c0; font-weight: bold; font-size: 12px;"); stats_row.addWidget(self.stat_cleaned)
+        self.stat_created = QLabel("✅ 0"); self.stat_created.setStyleSheet("color: #4ec9b0; font-weight: bold; font-size: 11px;"); stats_row.addWidget(self.stat_created)
+        self.stat_updated = QLabel("🔄 0"); self.stat_updated.setStyleSheet("color: #569cd6; font-weight: bold; font-size: 11px;"); stats_row.addWidget(self.stat_updated)
+        self.stat_failed = QLabel("❌ 0"); self.stat_failed.setStyleSheet("color: #f44747; font-weight: bold; font-size: 11px;"); stats_row.addWidget(self.stat_failed)
+        self.stat_deferred = QLabel("⏳ 0"); self.stat_deferred.setStyleSheet("color: #e3b341; font-weight: bold; font-size: 11px;"); stats_row.addWidget(self.stat_deferred)
+        self.stat_skipped = QLabel("⏭️ 0"); self.stat_skipped.setStyleSheet("color: #808080; font-weight: bold; font-size: 11px;"); stats_row.addWidget(self.stat_skipped)
+        self.stat_cleaned = QLabel("🧹 0 files"); self.stat_cleaned.setStyleSheet("color: #c586c0; font-weight: bold; font-size: 11px;"); stats_row.addWidget(self.stat_cleaned)
         stats_row.addStretch()
-        self.stat_elapsed = QLabel("⏱️ 0m 0s"); self.stat_elapsed.setStyleSheet("color: #d4d4d4; font-size: 12px;"); stats_row.addWidget(self.stat_elapsed)
+        self.stat_elapsed = QLabel("⏱️ 0m 0s"); self.stat_elapsed.setStyleSheet("color: #d4d4d4; font-size: 11px;"); stats_row.addWidget(self.stat_elapsed)
         progress_layout.addLayout(stats_row)
         progress_group.setLayout(progress_layout)
-        main_layout.addWidget(progress_group)
-
-        self.thread_progress_group = QGroupBox("Thread Progress (Per-Worker Status)")
-        self.thread_progress_group.setStyleSheet("QGroupBox { font-weight: bold; color: #d4d4d4; border: 1px solid #3c3c3c; border-radius: 6px; margin-top: 10px; padding-top: 16px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
-        self.thread_progress_layout = QVBoxLayout()
-        self.thread_progress_group.setLayout(self.thread_progress_layout)
-        main_layout.addWidget(self.thread_progress_group)
+        right_layout.addWidget(progress_group)
 
         self.stats_label = QLabel("")
         self.stats_label.setStyleSheet("background-color: #2d2d30; color: #d4d4d4; padding: 6px; border: 1px solid #3c3c3c; border-radius: 4px; font-size: 11px;")
         self.stats_label.setVisible(False)
-        main_layout.addWidget(self.stats_label)
+        self.stats_label.setWordWrap(True)
+        right_layout.addWidget(self.stats_label)
 
+        # 3. Thread Progress (Scrollable)
+        thread_group = QGroupBox("🧵 Thread Progress")
+        thread_group.setStyleSheet("QGroupBox { font-weight: bold; color: #d4d4d4; border: 1px solid #3c3c3c; border-radius: 6px; margin-top: 4px; padding-top: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }")
+        thread_layout = QVBoxLayout()
+        
+        self.thread_scroll = QScrollArea()
+        self.thread_scroll.setWidgetResizable(True)
+        self.thread_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.thread_scroll_widget = QWidget()
+        self.thread_scroll_layout = QVBoxLayout(self.thread_scroll_widget)
+        self.thread_scroll_layout.setSpacing(4)
+        self.thread_scroll_layout.setContentsMargins(4, 4, 4, 4)
+        self.thread_scroll.setWidget(self.thread_scroll_widget)
+        self.thread_scroll.setMaximumHeight(220) # Prevent it from pushing logs off screen
+        
+        thread_layout.addWidget(self.thread_scroll)
+        thread_group.setLayout(thread_layout)
+        right_layout.addWidget(thread_group)
+
+        # 4. Log Output
+        log_header = QLabel("📜 Execution Log")
+        log_header.setStyleSheet("color: #d4d4d4; font-weight: bold; font-size: 12px; margin-top: 4px;")
+        right_layout.addWidget(log_header)
+        
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setFont(QFont("Consolas", 9))
-        self.log_output.setStyleSheet("QTextEdit { background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #3c3c3c; border-radius: 4px; padding: 6px; }")
-        main_layout.addWidget(self.log_output)
+        self.log_output.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                border-radius: 6px;
+                padding: 8px;
+            }
+        """)
+        right_layout.addWidget(self.log_output)
+
+        # Add panels to splitter
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        
+        # Use stretch factors for proportional sizing
+        splitter.setStretchFactor(0, 1)  # Left panel
+        splitter.setStretchFactor(1, 1)  # Right panel
 
     def _build_thread_progress_ui(self):
         for row in self._thread_progress_rows.values():
-            self.thread_progress_layout.removeWidget(row)
+            self.thread_scroll_layout.removeWidget(row)
             row.deleteLater()
         self._thread_progress_rows.clear()
         for i in range(1, self.threads_spin.value() + 1):
             row = ThreadProgressRow(i)
             self._thread_progress_rows[i] = row
-            self.thread_progress_layout.addWidget(row)
+            self.thread_scroll_layout.addWidget(row)
 
     def _on_threads_changed(self, value: int):
         if not self.running:
@@ -470,6 +567,9 @@ class GitRepoCreatorApp(QMainWindow):
         self.show_log_check.setChecked(data.get("show_git_log", True))
         self.squash_check.setChecked(data.get("squash_history", False))
         self.surgical_check.setChecked(data.get("surgical_history", False))
+        self.keep_untracked_check.setChecked(data.get("keep_untracked", False))
+        self.remove_workflows_check.setChecked(data.get("remove_workflows", False))
+        self.reset_on_start_check.setChecked(data.get("reset_on_start", False))
         for edit, key in [(self.extensions_edit, "extensions"), (self.media_exts_edit, "media_exts"), (self.dirs_edit, "dirs_to_remove")]:
             if key in data: edit.setPlainText(data[key])
         if "geometry" in data:
@@ -484,8 +584,11 @@ class GitRepoCreatorApp(QMainWindow):
             "license_type": self.license_combo.currentText(), "rate_limit": self.rate_limit_spin.value(),
             "concurrency": self.threads_spin.value(), "squash_history": self.squash_check.isChecked(),
             "surgical_history": self.surgical_check.isChecked(), "show_git_log": self.show_log_check.isChecked(),
+            "keep_untracked": self.keep_untracked_check.isChecked(),
             "extensions": self.extensions_edit.toPlainText(), "media_exts": self.media_exts_edit.toPlainText(),
-            "dirs_to_remove": self.dirs_edit.toPlainText(), "geometry": self.saveGeometry().toHex().data().decode('utf-8')
+            "dirs_to_remove": self.dirs_edit.toPlainText(), "geometry": self.saveGeometry().toHex().data().decode('utf-8'),
+            "remove_workflows": self.remove_workflows_check.isChecked(),
+            "reset_on_start": self.reset_on_start_check.isChecked()
         }
         try:
             with open(os.path.join(os.path.expanduser("~"), ".git_creator_settings.json"), "w", encoding="utf-8") as f:
@@ -655,49 +758,6 @@ class GitRepoCreatorApp(QMainWindow):
                 except Exception: pass
         except Exception: pass
 
-    def reset_progress(self):
-        folder = self.folder_edit.text().strip()
-        if not folder:
-            QMessageBox.information(self, "Info", "Select a folder first.")
-            return
-        pf = os.path.join(folder, ".git_creator_progress.json")
-        if os.path.exists(pf):
-            if QMessageBox.question(self, "Reset Progress", "Delete saved progress for this folder?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-                os.remove(pf)
-                self._log("Progress file deleted.", "info")
-        else:
-            QMessageBox.information(self, "Info", "No progress file found.")
-
-    def force_cleanup_git_folders(self):
-        folder = self.folder_edit.text().strip()
-        if not folder or not os.path.isdir(folder):
-            QMessageBox.critical(self, "Error", "Please select a valid parent folder first.")
-            return
-        if QMessageBox.question(self, "Force Cleanup", "This will DELETE all .git folders in the selected directory.\n\n⚠️ This will erase ALL Git history for all repositories!\nContinue?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
-            return
-        self._log("=" * 60, "warn")
-        self._log("FORCE CLEANUP MODE - Deleting all .git folders...", "warn")
-        self._log("=" * 60, "warn")
-        deleted, failed = 0, 0
-        try:
-            subfolders = [os.path.join(folder, d) for d in os.listdir(folder) if os.path.isdir(os.path.join(folder, d)) and not d.startswith(".") and d.lower() not in self.EXCLUDE_FOLDERS]
-        except Exception as e:
-            self._log(f"Failed to list subfolders: {e}", "fail")
-            return
-        for sf in subfolders:
-            git_dir = os.path.join(sf, ".git")
-            if os.path.exists(git_dir):
-                self._log(f"  · Processing {os.path.basename(sf)}...", "info")
-                if self._delete_git_directory(git_dir):
-                    self._log(f"    ✓ Deleted .git folder", "success")
-                    deleted += 1
-                else:
-                    self._log(f"    ✗ Failed to delete .git folder", "fail")
-                    failed += 1
-        self._log("=" * 60, "info")
-        self._log(f"Cleanup complete: {deleted} deleted, {failed} failed", "info")
-        QMessageBox.information(self, "Cleanup Complete", f"Deleted: {deleted}\nFailed: {failed}")
-
     def _get_thread_id(self) -> int:
         match = re.search(r'_(\d+)$', threading.current_thread().name)
         return int(match.group(1)) + 1 if match else 0
@@ -709,6 +769,11 @@ class GitRepoCreatorApp(QMainWindow):
         tid = str(int(match.group(1)) + 1) if match else thread_name
         repo_name = getattr(self._thread_local, 'current_repo', None)
         return f"[T-{tid} | {repo_name}]" if repo_name else f"[T-{tid}]"
+
+    def _sanitize_repo_name(self, name: str) -> str:
+        sanitized = re.sub(r'[^a-zA-Z0-9_-]', '-', name)
+        sanitized = re.sub(r'-+', '-', sanitized).strip('-')
+        return sanitized if sanitized else "untitled-repo"
 
     def _safe_emit(self, signal_func, *args):
         try:
@@ -802,12 +867,39 @@ class GitRepoCreatorApp(QMainWindow):
         mins, secs = divmod(int(elapsed), 60)
         self.stat_elapsed.setText(f"⏱️ {mins}m {secs}s")
 
-    def _log(self, msg: str, tag: str = "info"):
+    def _log(self, msg: str, tag: str = "info", repo_name: str = None):
         thread_label = self._get_thread_label()
+        
+        # 1. Always write to file logger immediately (real-time file logging is preserved)
         if hasattr(self, 'logger'):
-            if tag in ("fail", "critical", "warn"): self.logger.warning(f"{thread_label} {msg}")
-            else: self.logger.info(f"{thread_label} {msg}")
+            if tag in ("fail", "critical", "warn"): 
+                self.logger.warning(f"{thread_label} {msg}")
+            else: 
+                self.logger.info(f"{thread_label} {msg}")
+                
+        # 2. Determine target repo for buffering
+        target_repo = repo_name or getattr(self._thread_local, 'current_repo', None)
+        
+        # 3. Buffer if active, otherwise emit immediately (fallback for main thread)
+        if target_repo:
+            with self._repo_log_lock:
+                if target_repo in self._repo_log_buffers:
+                    self._repo_log_buffers[target_repo].append((msg, tag, thread_label))
+                    return
+                    
         self._safe_emit(self.signals.log_signal.emit, msg, tag, thread_label)
+
+    def append_log_block(self, html_block: str):
+        cursor = self.log_output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertHtml(html_block)
+        if self.log_output.document().blockCount() > 5000:
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.KeepAnchor, 1000)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
+        self.log_output.setTextCursor(cursor)
+        self.log_output.ensureCursorVisible()
 
     def _report_step(self, step_name: str, current: int, total: int, status: str = "running"):
         self._safe_emit(self.signals.step_signal.emit, current, total, step_name, status)
@@ -1030,6 +1122,7 @@ class GitRepoCreatorApp(QMainWindow):
         return False
 
     def _run_git_add_with_monitoring(self, sf: str, timeout: int = 60, total_files: int = 0) -> Tuple[bool, str]:
+        repo_name = getattr(self._thread_local, 'current_repo', None) 
         self._log(f"  · Running git add -A with trace (timeout: {timeout}s)...", "info")
         index_lock = os.path.join(sf, ".git", "index.lock")
         if os.path.exists(index_lock):
@@ -1069,8 +1162,8 @@ class GitRepoCreatorApp(QMainWindow):
                         with stderr_lock:
                             stderr_lines.append(line.rstrip())
                             line_lower = line.lower()
-                            if any(kw in line_lower for kw in ["trace:", "error", "fatal", "wait", "lock", "lfs", "filter", "credential", "index"]):
-                                self._log(f"     [git-trace] {line.rstrip()}", "trace")
+                            if any(kw in line_lower for kw in ["error", "fatal", "wait", "lock", "lfs", "filter", "credential", "index"]):
+                                self._log(f"     [git-trace] {line.rstrip()}", "trace", repo_name=repo_name)
                 except Exception: pass
             def read_stdout():
                 try:
@@ -1095,19 +1188,19 @@ class GitRepoCreatorApp(QMainWindow):
                 elapsed = time.time() - start_time
                 if elapsed - last_progress > 3:
                     with stderr_lock: trace_count = len(stderr_lines)
-                    self._log(f"  ⏳ git add still running... ({int(elapsed)}s, {trace_count} trace lines, {files_added_count[0]} files added)", "warn")
+                    self._log(f"  ⏳ git add still running... ({int(elapsed)}s, {trace_count} trace lines, {files_added_count[0]} files added)", "warn", repo_name=repo_name)
                     if os.path.exists(index_lock):
                         try:
                             os.remove(index_lock)
-                            self._log(f"  ✓ Removed index.lock", "success")
+                            self._log(f"  ✓ Removed index.lock", "success", repo_name=repo_name)
                         except Exception as e:
-                            self._log(f"  ✗ Could not remove index.lock: {e}", "fail")
+                            self._log(f"  ✗ Could not remove index.lock: {e}", "fail", repo_name=repo_name)
                     last_progress = time.time()
                 if elapsed > timeout:
                     try: process.terminate(); process.wait(timeout=3)
                     except subprocess.TimeoutExpired: process.kill()
-                    self._log(f"  ⏱️ GIT ADD TIMED OUT after {int(elapsed)}s!", "critical")
-                    self._log(f"     └─ Files added so far: {files_added_count[0]}", "critical")
+                    self._log(f"  ⏱️ GIT ADD TIMED OUT after {int(elapsed)}s!", "critical", repo_name=repo_name)
+                    self._log(f"     └─ Files added so far: {files_added_count[0]}", "critical", repo_name=repo_name)
                     with stderr_lock:
                         last_lines = stderr_lines[-30:]
                         full_trace = "\n".join(stderr_lines).lower()
@@ -1252,6 +1345,48 @@ class GitRepoCreatorApp(QMainWindow):
         media_archive_exts = self.get_media_exts()
         dirs_to_remove = self.get_dirs_to_remove()
         bytes_freed, files_cleaned = 0, 0
+        
+        # ★ PHASE 1: Remove GitHub Actions workflows if option is checked
+        if self.remove_workflows_check.isChecked():
+            github_dir = os.path.join(sf, ".github")
+            if os.path.exists(github_dir):
+                self._log("  · Removing GitHub Actions workflows and .github directory...", "info")
+                try:
+                    # Count workflow files for logging
+                    workflow_count = 0
+                    workflows_path = os.path.join(github_dir, "workflows")
+                    if os.path.exists(workflows_path):
+                        workflow_count = len([f for f in os.listdir(workflows_path) 
+                                            if f.endswith(('.yml', '.yaml'))])
+                    
+                    # Calculate directory size
+                    dir_size = sum(os.path.getsize(os.path.join(dp, f)) 
+                                  for dp, _, fns in os.walk(github_dir) for f in fns)
+                    
+                    if self.dry_run:
+                        self._log(f"  [DRY RUN] Would remove .github directory ({workflow_count} workflow files, {self._format_size(dir_size // 1024)})", "dryrun")
+                    else:
+                        # First, untrack all .github files from git index
+                        ok, tracked = self.run_cmd(["git", "ls-files", ".github"], sf, dry_run_safe=True)
+                        if ok and tracked.strip():
+                            tracked_files = [f for f in tracked.strip().split('\n') if f.strip()]
+                            if tracked_files:
+                                self._log(f"  · Untracking {len(tracked_files)} .github files from git index...", "info")
+                                batch_size = 100
+                                for i in range(0, len(tracked_files), batch_size):
+                                    batch = tracked_files[i:i+batch_size]
+                                    self.run_cmd(["git", "rm", "-r", "--cached", "--ignore-unmatch"] + batch, sf)
+                        
+                        # Remove the entire .github directory
+                        shutil.rmtree(github_dir)
+                        bytes_freed += dir_size
+                        files_cleaned += 1
+                        
+                        self._log(f"  ✓ Removed .github directory ({workflow_count} workflow files, {self._format_size(dir_size // 1024)})", "success")
+                except Exception as e:
+                    self._log(f"    Warning: Could not remove .github directory: {e}", "warn")
+        
+        # ★ PHASE 2: Untrack media/archive/AI model files from git index
         files_to_rm = []
         ok, tracked = self.run_cmd(["git", "ls-files"], sf, dry_run_safe=True)
         if ok:
@@ -1265,11 +1400,18 @@ class GitRepoCreatorApp(QMainWindow):
             batch_size = 100
             for i in range(0, len(files_to_rm), batch_size):
                 self.run_cmd(["git", "rm", "-r", "--cached", "--ignore-unmatch"] + files_to_rm[i:i+batch_size], sf)
+        
+        # ★ PHASE 3: Check if we should keep files on disk (only untrack)
+        keep_on_disk = self.keep_untracked_check.isChecked()
+
+        # ★ PHASE 4: Walk filesystem and remove directories/files
         for root, dirs, files in os.walk(sf, topdown=True):
             if self.cancelled: break
             if ".git" in root:
                 dirs[:] = []
                 continue
+            
+            # Remove unwanted directories
             for d in [d for d in dirs if d in dirs_to_remove]:
                 dirs.remove(d)
                 dir_path = os.path.join(root, d)
@@ -1285,6 +1427,8 @@ class GitRepoCreatorApp(QMainWindow):
                     files_cleaned += 1
                 except Exception as e:
                     self._log(f"    Warning: Could not remove {dir_path}: {e}", "warn")
+            
+            # Remove unwanted files
             for f in files:
                 if self.cancelled: break
                 _, ext = os.path.splitext(f.lower())
@@ -1293,27 +1437,40 @@ class GitRepoCreatorApp(QMainWindow):
                     try:
                         sz = os.path.getsize(file_path) if not self.dry_run else 0
                         if self.dry_run:
-                            self._log(f"  [DRY RUN] Would remove file: {file_path} ({self._format_size(sz // 1024)})", "dryrun")
+                            action = "untrack" if keep_on_disk else "delete"
+                            self._log(f"  [DRY RUN] Would {action} file: {file_path} ({self._format_size(sz // 1024)})", "dryrun")
                         else:
-                            os.remove(file_path)
-                            self._log(f"  · Deleted local file: {f} ({self._format_size(sz // 1024)}) to prevent push rejection", "info")
-                        bytes_freed += sz
+                            if not keep_on_disk:
+                                os.remove(file_path)
+                                self._log(f"  · Deleted local file: {f} ({self._format_size(sz // 1024)}) to prevent push rejection", "info")
+                                bytes_freed += sz
+                            else:
+                                self._log(f"  · Untracked from Git, kept on disk: {f} ({self._format_size(sz // 1024)})", "info")
                         files_cleaned += 1
                     except Exception as e:
-                        self._log(f"    Warning: Could not remove {file_path}: {e}", "warn")
+                        self._log(f"    Warning: Could not process {file_path}: {e}", "warn")
+        
+        # ★ PHASE 5: Update .gitignore to prevent future tracking
         gitignore_path = os.path.join(sf, ".gitignore")
         default_ignores = ["# Media, Archives, and AI Models"]
         for ext in sorted(list(media_archive_exts)):
             default_ignores.append(f"*{ext}" if not ext.startswith('*') else ext)
         default_ignores.extend(["# Python / Dev", "*.py[cod]", ".env", ".env.local", "*.log", "Thumbs.db", ".DS_Store", "*.tmp", "*.bak"])
+        
+        # Add GitHub Actions ignore if workflows are being removed
+        if self.remove_workflows_check.isChecked():
+            default_ignores.extend(["# GitHub Actions", ".github/"])
+        
         try:
             if self.dry_run:
                 self._log(f"  [DRY RUN] Would ensure .gitignore has media/dev exclusions.", "dryrun")
             elif not os.path.exists(gitignore_path):
-                with open(gitignore_path, "w", encoding="utf-8") as f: f.write("\n".join(default_ignores) + "\n")
+                with open(gitignore_path, "w", encoding="utf-8") as f: 
+                    f.write("\n".join(default_ignores) + "\n")
                 self._log("  · Created default .gitignore.", "info")
             else:
-                with open(gitignore_path, "r", encoding="utf-8") as f: existing = f.read()
+                with open(gitignore_path, "r", encoding="utf-8") as f: 
+                    existing = f.read()
                 missing = [ign for ign in default_ignores if ign not in existing]
                 if missing:
                     with open(gitignore_path, "a", encoding="utf-8") as f:
@@ -1321,6 +1478,8 @@ class GitRepoCreatorApp(QMainWindow):
                     self._log("  · Updated .gitignore.", "info")
         except Exception as e:
             self._log(f"  ! .gitignore warning: {e}", "warn")
+        
+        # ★ PHASE 6: Update stats
         with self.stats_lock:
             self.stats["files_cleaned"] += files_cleaned
             self.stats["bytes_freed_estimate"] += bytes_freed
@@ -1416,7 +1575,6 @@ class GitRepoCreatorApp(QMainWindow):
         else:
             self._log(f"\n✓ All rate-limited repos successfully created!", "success")
 
-    # ★ COMPLETELY REWRITTEN: Safe, native Git squash using orphan branches
     def _squash_and_push(self, sf: str, gh_name: str, visibility: str) -> bool:
         if self.cancelled: return False
         steps = self.STEPS_SQUASH
@@ -1464,7 +1622,10 @@ class GitRepoCreatorApp(QMainWindow):
         self._report_step(f"{steps[1]}: Done", 2, total, "success")
 
         self._report_step(f"{steps[2]}: Creating orphan branch...", 3, total, "running")
-        self._log("  · Creating temporary orphan branch to squash history...", "info")
+        self._log("  · Preparing temporary orphan branch for history squash...", "info")
+        
+        self.run_cmd(["git", "branch", "-D", "temp_squash"], sf, dry_run_safe=True)
+        
         ok, err = self.run_cmd(["git", "checkout", "--orphan", "temp_squash"], sf, timeout=30)
         if not ok:
             self._log(f"  ✗ Failed to create orphan branch: {err.strip()}", "fail")
@@ -1474,10 +1635,7 @@ class GitRepoCreatorApp(QMainWindow):
         self._report_step(f"{steps[3]}: git add...", 4, total, "running")
         file_count, total_size = self._count_files_and_size(sf)
         self._log(f"  · Found {file_count:,} files totaling {self._format_size(total_size // 1024)}", "info")
-        
-        # Untrack everything first to ensure a clean slate on the orphan branch
         self.run_cmd(["git", "rm", "-rf", "--cached", "."], sf, dry_run_safe=True)
-        
         if file_count > 10000:
             ok = self._batch_git_add(sf, file_count)
         else:
@@ -1496,29 +1654,17 @@ class GitRepoCreatorApp(QMainWindow):
 
         self._report_step(f"{steps[5]}: Force pushing...", 6, total, "running")
         self._log("  · Force-pushing squashed history to 'origin/master'...", "info")
-        
-        # ★ Force push to master branch
-        ok_push, push_err = self.run_cmd(
-            ["git", "push", "--force", "--set-upstream", "origin", "temp_squash:master"], 
-            sf, timeout=600
-        )
-        
+        ok_push, push_err = self.run_cmd(["git", "push", "--force", "--set-upstream", "origin", "temp_squash:master"], sf, timeout=600)
         if not ok_push:
             self._log(f"  ✗ Force push failed: {push_err.strip()}", "fail")
             self._report_step(f"{steps[5]}: Failed", 6, total, "error")
             return False
-            
         self._log(f"  ✓ Successfully force-pushed squashed history to 'master'.", "success")
-        
-        # ★ Cleanup: Delete all other branches and rename temp_squash to master
         self._log("  · Cleaning up local branches...", "info")
         self.run_cmd(["git", "branch", "-D", "main"], sf, dry_run_safe=True)
         self.run_cmd(["git", "branch", "-D", "master"], sf, dry_run_safe=True)
         self.run_cmd(["git", "branch", "-m", "master"], sf, dry_run_safe=True)
-        
-        # Set upstream tracking for master
         self.run_cmd(["git", "branch", "--set-upstream-to=origin/master", "master"], sf, dry_run_safe=True)
-        
         self._report_step(f"{steps[5]}: Done", 6, total, "success")
         self._log_recent_git_history(sf, gh_name)
         return True
@@ -1568,8 +1714,6 @@ class GitRepoCreatorApp(QMainWindow):
             self._log_recent_git_history(sf, gh_name)
             return True
         self._log(f"  ✗ Initial force-push failed for '{gh_name}'.", "fail")
-        err_lines = (err or "").strip().split('\n')
-        self._log(f"  └─ Raw error output:\n{(err or '').strip()}", "warn")
         err_lower = (err or "").lower()
         if "timed out" in err_lower or "timeout" in err_lower:
             git_dir = os.path.join(sf, '.git')
@@ -1659,6 +1803,18 @@ class GitRepoCreatorApp(QMainWindow):
         self.cancel_btn.setText("■ Cancel")
         self.force_quit_btn.setVisible(False)
         self.report_btn.setEnabled(False)
+        
+        if self.reset_on_start_check.isChecked():
+            progress_file = os.path.join(folder, ".git_creator_progress.json")
+            if os.path.exists(progress_file):
+                try:
+                    os.remove(progress_file)
+                    self._log("🔄 Progress file deleted. All repositories will be reprocessed from scratch.", "warn")
+                except Exception as e:
+                    self._log(f"⚠️ Could not delete progress file: {e}", "warn")
+            else:
+                self._log("ℹ️ No progress file found. Starting fresh.", "info")
+        
         self._worker_thread = threading.Thread(target=self.process_folders, args=(folder, commit_msg), daemon=True)
         self._worker_thread.start()
 
@@ -1698,76 +1854,86 @@ class GitRepoCreatorApp(QMainWindow):
             nonlocal completed_count
             name = os.path.basename(sf)
             self._thread_local.current_repo = name
-            if self.cancelled: return None
-            if name in self.completed_repos:
-                self._log(f"--- (already done, skipping)", "info")
+            
+            # 1. Initialize buffer for this repository
+            with self._repo_log_lock:
+                self._repo_log_buffers[name] = []
+            
+            try:
+                if self.cancelled: return None
+                if name in self.completed_repos:
+                    self._log(f"--- (already done, skipping)", "info")
+                    with self.stats_lock:
+                        self.stats["skipped"] += 1
+                        self.stats["processed"] += 1
+                    with completed_lock:
+                        completed_count += 1
+                        self._safe_emit(self.signals.progress_signal.emit, completed_count, total, name)
+                        self._update_global_progress(completed_count, total, name, "skipped")
+                    return None
+                
+                gh_name = self._sanitize_repo_name(name)
+                if name != gh_name:
+                    self._log(f"Note: Using '{gh_name}' as GitHub repo name (sanitized from '{name}').", "info")
+                    
+                self._log(f"--- Starting processing ---", "info")
+                self._safe_emit(self.signals.repo_start_signal.emit, name)
+                self._update_global_progress(completed_count, total, name, "processing")
+                size_before = self._analyze_repo_size(sf)
+                has_git = os.path.isdir(os.path.join(sf, ".git"))
+                ok = True
+                action = "updated" if has_git else "created"
+                if not has_git:
+                    ok = self._create_new_repo(sf, gh_name, commit_msg, visibility)
+                else:
+                    ok = self._update_existing_repo(sf, gh_name, commit_msg, visibility)
+                size_after = self._analyze_repo_size(sf)
                 with self.stats_lock:
-                    self.stats["skipped"] += 1
+                    self.stats["repo_sizes_before"][name] = size_before
+                    self.stats["repo_sizes_after"][name] = size_after
                     self.stats["processed"] += 1
+                    if ok:
+                        self.stats[action] += 1
+                        if not self.dry_run: self._save_progress(name)
+                    else:
+                        with self._rate_limited_lock:
+                            is_rate_limited = any(r["gh_name"] == gh_name for r in self._rate_limited_repos)
+                        if not is_rate_limited:
+                            self.stats["failed"] += 1
+                            self.stats["errors"].append({"repo": name, "action": action})
+                self._safe_emit(self.signals.repo_done_signal.emit, name, ok)
                 with completed_lock:
                     completed_count += 1
                     self._safe_emit(self.signals.progress_signal.emit, completed_count, total, name)
-                    self._update_global_progress(completed_count, total, name, "skipped")
-                return None
-            gh_name = name.replace(" ", "-")
-            if name != gh_name:
-                self._log(f"Note: Using '{gh_name}' as GitHub repo name.", "info")
-            self._log(f"--- Starting processing ---", "info")
-            self._safe_emit(self.signals.repo_start_signal.emit, name)
-            self._update_global_progress(completed_count, total, name, "processing")
-            size_before = self._analyze_repo_size(sf)
-            has_git = os.path.isdir(os.path.join(sf, ".git"))
-            ok = True
-            action = "updated" if has_git else "created"
-            if not has_git:
-                ok = self._create_new_repo(sf, gh_name, commit_msg, visibility)
-            else:
-                ok = self._update_existing_repo(sf, gh_name, commit_msg, visibility)
-            size_after = self._analyze_repo_size(sf)
-            with self.stats_lock:
-                self.stats["repo_sizes_before"][name] = size_before
-                self.stats["repo_sizes_after"][name] = size_after
-                self.stats["processed"] += 1
-                if ok:
-                    self.stats[action] += 1
-                    if not self.dry_run: self._save_progress(name)
-                else:
                     with self._rate_limited_lock:
                         is_rate_limited = any(r["gh_name"] == gh_name for r in self._rate_limited_repos)
-                    if not is_rate_limited:
-                        self.stats["failed"] += 1
-                        self.stats["errors"].append({"repo": name, "action": action})
-            self._safe_emit(self.signals.repo_done_signal.emit, name, ok)
-            with completed_lock:
-                completed_count += 1
-                self._safe_emit(self.signals.progress_signal.emit, completed_count, total, name)
-                with self._rate_limited_lock:
-                    is_rate_limited = any(r["gh_name"] == gh_name for r in self._rate_limited_repos)
-                status = "completed" if ok else ("deferred" if is_rate_limited else "failed")
-                self._update_global_progress(completed_count, total, name, status)
-            self._safe_emit(self.signals.stats_signal.emit, f"Done: {self.stats['created']} created | {self.stats['updated']} updated | {self.stats['failed']} failed | {len(self._rate_limited_repos)} deferred | {self.stats['skipped']} skipped")
-            thread_id = self._get_thread_id()
-            if thread_id > 0:
-                self._safe_emit(self.signals.thread_progress_signal.emit, thread_id, "", "💤 Idle", 0, "idle")
-            self._thread_local.current_repo = None
-            return ok
-
-        try:
-            futures = {self._executor.submit(process_single, sf): sf for sf in subfolders}
-            for future in concurrent.futures.as_completed(futures):
-                if self.cancelled:
-                    for f in futures: f.cancel()
-                    break
-                try: future.result()
-                except Exception as e:
-                    self._log(f"Unexpected error in thread: {e}", "fail")
-        finally:
-            if self._executor:
-                self._executor.shutdown(wait=True)
-                self._executor = None
-        if self._rate_limited_repos and not self.cancelled:
-            self._retry_rate_limited_repos(commit_msg)
-        self._safe_emit(self.signals.finished_signal.emit)
+                    status = "completed" if ok else ("deferred" if is_rate_limited else "failed")
+                    self._update_global_progress(completed_count, total, name, status)
+                self._safe_emit(self.signals.stats_signal.emit, f"Done: {self.stats['created']} created | {self.stats['updated']} updated | {self.stats['failed']} failed | {len(self._rate_limited_repos)} deferred | {self.stats['skipped']} skipped")
+                thread_id = self._get_thread_id()
+                if thread_id > 0:
+                    self._safe_emit(self.signals.thread_progress_signal.emit, thread_id, "", "💤 Idle", 0, "idle")
+                self._thread_local.current_repo = None
+                return ok
+                
+            finally:
+                # 2. GUARANTEED FLUSH: Ensures logs are printed consecutively even if the repo crashes
+                with self._repo_log_lock:
+                    buffer = self._repo_log_buffers.pop(name, [])
+                
+                if buffer:
+                    html_blocks = []
+                    color_map = {"success": "#4ec9b0", "fail": "#f44747", "info": "#569cd6", "warn": "#ce9178", "critical": "#ffffff", "dryrun": "#c586c0", "trace": "#808080"}
+                    bg_map = {"critical": "#721c24", "dryrun": "#2d1f3d", "trace": "#252526"}
+                    
+                    for l_msg, l_tag, l_thread_label in buffer:
+                        color, bg = color_map.get(l_tag, "#d4d4d4"), bg_map.get(l_tag, "transparent")
+                        safe_msg = escape(l_msg).replace('\n', '<br>')
+                        bg_style = f" background-color: {bg};" if bg != "transparent" else ""
+                        html_blocks.append(f'<span style="color: #808080; font-weight: bold;">{escape(l_thread_label)}</span> <span style="color: {color};{bg_style}">{safe_msg}</span><br>')
+                    
+                    combined_html = "".join(html_blocks)
+                    self._safe_emit(self.signals.flush_log_signal.emit, combined_html)
 
     def _create_new_repo(self, sf: str, gh_name: str, commit_msg: str, visibility: str) -> bool:
         if self.cancelled: return False
@@ -1827,7 +1993,6 @@ class GitRepoCreatorApp(QMainWindow):
                 return self._update_existing_repo(sf, gh_name, commit_msg, visibility)
             else:
                 self._log(f"  ✗ gh repo create failed for '{gh_name}'.", "fail")
-                err_lines = (err or "").strip().split('\n')
                 self._log(f"  └─ Raw error:\n{(err or '').strip()}", "fail")
                 self._report_step(f"{steps[4]}: Failed", 5, total, "error")
                 return False
@@ -1876,6 +2041,16 @@ class GitRepoCreatorApp(QMainWindow):
                 else:
                     self._log(f"  ✗ gh repo create failed: {(err or '').strip()}", "fail")
                     return False
+        else:
+            ok_url, current_url = self.run_cmd(["git", "remote", "get-url", "origin"], sf, dry_run_safe=True)
+            if ok_url and current_url.strip():
+                current_url = current_url.strip()
+                name = os.path.basename(sf)
+                if name in current_url and gh_name != name:
+                    fixed_url = current_url.replace(name, gh_name)
+                    self._log(f"  ⚠️ Remote URL contains invalid characters ('{name}'). Fixing to: {fixed_url}", "warn")
+                    self.run_cmd(["git", "remote", "set-url", "origin", fixed_url], sf)
+
         self._report_step(f"{steps[1]}: git add...", 2, total, "running")
         file_count, total_size = self._count_files_and_size(sf)
         self._log(f"  · Found {file_count:,} files totaling {self._format_size(total_size // 1024)}", "info")

@@ -118,6 +118,8 @@ latexoutput/
 *.blg
 *.bbl
 
+*.json
+
 Real-ESRGAN/
 
 

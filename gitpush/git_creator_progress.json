@@ -1,21 +1,21 @@
 {
-  "session_id": "20261011_070336",
-  "started_at": 1791715421.8084207,
-  "elapsed_seconds": 1194,
-  "current": 128,
+  "session_id": "20261011_144747",
+  "started_at": 1791744466.8479278,
+  "elapsed_seconds": 0,
+  "current": 0,
   "total": 155,
-  "percentage": 82,
-  "current_repo": "TerrainGenerator",
-  "status": "completed",
+  "percentage": 0,
+  "current_repo": "",
+  "status": "scanning",
   "stats": {
-    "created": 24,
-    "updated": 79,
+    "created": 0,
+    "updated": 0,
     "failed": 0,
-    "skipped": 25,
-    "files_cleaned": 92,
-    "bytes_freed": 58845839,
+    "skipped": 0,
+    "files_cleaned": 0,
+    "bytes_freed": 0,
     "deferred": 0
   },
   "cancelled": false,
-  "updated_at": "2026-10-11T07:03:36.667566"
+  "updated_at": "2026-10-11T14:47:47.071181"
 }
