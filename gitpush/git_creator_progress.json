@@ -1,21 +1,21 @@
 {
-  "session_id": "20261011_184223",
-  "started_at": 1791758349.250865,
-  "elapsed_seconds": 194,
-  "current": 99,
-  "total": 99,
+  "session_id": "20261011_191150",
+  "started_at": 1791760046.3569505,
+  "elapsed_seconds": 264,
+  "current": 74,
+  "total": 74,
   "percentage": 100,
   "current_repo": "",
   "status": "completed_with_issues",
   "stats": {
     "created": 0,
-    "updated": 92,
-    "failed": 7,
+    "updated": 72,
+    "failed": 2,
     "skipped": 0,
     "files_cleaned": 0,
     "bytes_freed": 0,
     "deferred": 0
   },
   "cancelled": false,
-  "updated_at": "2026-10-11T18:42:23.784579"
+  "updated_at": "2026-10-11T19:11:50.868179"
 }

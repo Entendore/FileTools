@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QPlainTextEdit,
-    QProgressBar, QGroupBox, QFileDialog, QMessageBox, QScrollArea, QTextEdit, QSplitter
+    QProgressBar, QGroupBox, QFileDialog, QMessageBox, QScrollArea, QTextEdit, QSplitter,
+    QListWidget, QAbstractItemView
 )
 from PySide6.QtCore import Qt, QObject, Signal, QTimer
 from PySide6.QtGui import QFont, QColor, QTextCursor, QPalette
@@ -105,12 +106,12 @@ class ThreadProgressRow(QWidget):
 
 class GitRepoCreatorApp(QMainWindow):
     """
-    Git Repo Creator / Updater v8.0 (PySide6)
-    ★ IMPROVEMENTS:
-    - Highly modularized: Extracted Git/GitHub helpers, Push fallbacks, and Cleanup phases.
-    - Eliminated duplicate code for remote linking, pushing, and git add operations.
-    - Centralized HTML log formatting and progress bar styling.
-    - Improved readability and maintainability while preserving all features.
+    Git Repo Creator / Updater v9.0 (PySide6)
+    ★ NEW FEATURES:
+    - Multiple Parent Folders: Process multiple root directories sequentially.
+    - Global Progress Tracking: The main progress bar now accurately reflects 
+      the total subfolders across ALL selected parent folders.
+    - Preserved all v8.0 modular enhancements (Git helpers, cleanup phases, etc.).
     """
     EXCLUDE_FOLDERS: Set[str] = {"input", "output", "temp", "venv", ".venv", "__pycache__",
                                  "node_modules", "build", "dist"}
@@ -144,7 +145,7 @@ class GitRepoCreatorApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Git Repo Creator / Updater v8.0")
+        self.setWindowTitle("Git Repo Creator / Updater v9.0")
         self.resize(1200, 800)
         
         self.logger = logging.getLogger("GitRepoCreator")
@@ -261,12 +262,30 @@ class GitRepoCreatorApp(QMainWindow):
         basic_layout.setVerticalSpacing(8)
         basic_layout.setHorizontalSpacing(8)
 
-        self.folder_edit = QLineEdit()
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self.browse_folder)
-        basic_layout.addWidget(QLabel("Parent Folder:"), 0, 0)
-        basic_layout.addWidget(self.folder_edit, 0, 1)
-        basic_layout.addWidget(browse_btn, 0, 2)
+        # --- MULTIPLE FOLDERS UI ---
+        self.folder_list = QListWidget()
+        self.folder_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.folder_list.setMaximumHeight(90)
+        self.folder_list.setStyleSheet("QListWidget { background-color: #252526; border: 1px solid #3c3c3c; border-radius: 4px; color: #d4d4d4; }")
+        
+        self.add_folder_btn = QPushButton("Add Folder...")
+        self.add_folder_btn.clicked.connect(self.add_folder)
+        self.remove_folder_btn = QPushButton("Remove")
+        self.remove_folder_btn.clicked.connect(self.remove_selected_folders)
+        self.clear_folders_btn = QPushButton("Clear")
+        self.clear_folders_btn.clicked.connect(self.folder_list.clear)
+        
+        folder_btn_layout = QVBoxLayout()
+        folder_btn_layout.setSpacing(4)
+        for btn in [self.add_folder_btn, self.remove_folder_btn, self.clear_folders_btn]:
+            btn.setFixedHeight(26)
+            folder_btn_layout.addWidget(btn)
+        folder_btn_layout.addStretch()
+
+        basic_layout.addWidget(QLabel("Parent Folders:"), 0, 0, Qt.AlignmentFlag.AlignTop)
+        basic_layout.addWidget(self.folder_list, 0, 1)
+        basic_layout.addLayout(folder_btn_layout, 0, 2)
+        # -----------------------------
 
         self.commit_edit = QLineEdit()
         self.commit_edit.setText("Automated commit")
@@ -546,6 +565,22 @@ class GitRepoCreatorApp(QMainWindow):
     def get_dirs_to_remove(self) -> Set[str]:
         return {d.strip() for d in self.dirs_edit.toPlainText().split('\n') if d.strip()}
 
+    # --- MULTIPLE FOLDERS UI HANDLERS ---
+    def add_folder(self):
+        f = QFileDialog.getExistingDirectory(self, "Select Parent Folder")
+        if f:
+            existing = [self.folder_list.item(i).text() for i in range(self.folder_list.count())]
+            if f not in existing:
+                self.folder_list.addItem(f)
+
+    def remove_selected_folders(self):
+        for item in self.folder_list.selectedItems():
+            self.folder_list.takeItem(self.folder_list.row(item))
+
+    def get_parent_folders(self) -> List[str]:
+        return [self.folder_list.item(i).text() for i in range(self.folder_list.count())]
+    # ------------------------------------
+
     def _load_settings(self):
         path = os.path.join(os.path.expanduser("~"), ".git_creator_settings.json")
         if os.path.exists(path):
@@ -556,7 +591,13 @@ class GitRepoCreatorApp(QMainWindow):
     def _apply_settings_to_ui(self):
         data = self._saved_data
         if not data: return
-        self.folder_edit.setText(data.get("folder", ""))
+        
+        # Load multiple folders
+        folders = data.get("folders", [])
+        self.folder_list.clear()
+        for f in folders:
+            self.folder_list.addItem(f)
+            
         self.commit_edit.setText(data.get("commit_msg", "Automated commit"))
         for combo, key in [(self.visibility_combo, "visibility"), (self.license_combo, "license_type")]:
             idx = combo.findText(data.get(key, combo.itemText(0)))
@@ -580,7 +621,8 @@ class GitRepoCreatorApp(QMainWindow):
 
     def _save_settings(self):
         data = {
-            "folder": self.folder_edit.text(), "commit_msg": self.commit_edit.text(),
+            "folders": self.get_parent_folders(),
+            "commit_msg": self.commit_edit.text(),
             "visibility": self.visibility_combo.currentText(), "dry_run": self.dry_run_check.isChecked(),
             "auto_readme": self.auto_readme_check.isChecked(), "auto_license": self.auto_license_check.isChecked(),
             "license_type": self.license_combo.currentText(), "rate_limit": self.rate_limit_spin.value(),
@@ -761,7 +803,6 @@ class GitRepoCreatorApp(QMainWindow):
     # GIT & GITHUB HELPERS (MODULARIZED)
     # ==========================================
     def _execute_git_add(self, sf: str, total_files: int) -> bool:
-        """Unified git add logic: batch for large repos, monitored for small."""
         if total_files > 10000:
             return self._batch_git_add(sf, total_files)
         else:
@@ -772,7 +813,6 @@ class GitRepoCreatorApp(QMainWindow):
             return True
 
     def _ensure_remote_linked(self, sf: str, gh_name: str, visibility: str) -> bool:
-        """Ensures the local repo is linked to a valid GitHub remote."""
         ok, out = self.run_cmd(["git", "remote"], sf, dry_run_safe=True)
         remotes = out.strip().split()
         
@@ -797,7 +837,6 @@ class GitRepoCreatorApp(QMainWindow):
         return self._gh_create_or_link_repo(sf, gh_name, visibility)
 
     def _gh_create_or_link_repo(self, sf: str, gh_name: str, visibility: str) -> bool:
-        """Attempts to create a repo via gh CLI, or links if it already exists."""
         ok, err = self.gh_cmd(["gh", "repo", "create", gh_name, "--source=.", f"--{visibility}", "--remote=origin", "--push"], sf)
         if ok:
             self._log(f"  ✓ Created GitHub repo '{gh_name}' ({visibility}) and pushed.", "success")
@@ -821,7 +860,6 @@ class GitRepoCreatorApp(QMainWindow):
         return False
 
     def _link_existing_repo(self, sf: str, gh_name: str) -> bool:
-        """Links local repo to an existing GitHub repo."""
         ok_url, url_out = self.gh_cmd(["gh", "repo", "view", gh_name, "--json", "url"], sf, dry_run_safe=True)
         if ok_url:
             try:
@@ -844,7 +882,6 @@ class GitRepoCreatorApp(QMainWindow):
         return False
 
     def _push_with_fallbacks(self, sf: str, gh_name: str, branch: str, force: bool = False) -> bool:
-        """Unified push logic with force-with-lease, force, and token injection fallbacks."""
         if not force:
             ok, output = self.run_cmd(["git", "push", "-u", "origin", branch], sf, timeout=600)
             if ok:
@@ -857,7 +894,6 @@ class GitRepoCreatorApp(QMainWindow):
                 self._log(f"  ✓ Force-pushed (with lease).", "success")
                 return True
 
-        # Force push
         ok, err = self.run_cmd(["git", "push", "--force", "--set-upstream", "origin", f"{branch}:{branch}"], sf, timeout=600)
         if ok:
             self._log(f"  ✓ Force-pushed.", "success")
@@ -1339,7 +1375,6 @@ class GitRepoCreatorApp(QMainWindow):
                     try: process.terminate(); process.wait(timeout=3)
                     except subprocess.TimeoutExpired: process.kill()
                     self._log(f"  ⏱️ GIT ADD TIMED OUT after {int(elapsed)}s!", "critical", repo_name=repo_name)
-                    # Auto-fix logic omitted for brevity but preserved in spirit
                     return False, f"Command timed out after {int(elapsed)} seconds"
                 time.sleep(0.3)
 
@@ -1583,21 +1618,28 @@ class GitRepoCreatorApp(QMainWindow):
             return False
 
     # ==========================================
-    # THREADING & EXECUTION
+    # THREADING & EXECUTION (MULTI-FOLDER SUPPORT)
     # ==========================================
     def start_processing(self):
         if self.running: return
-        folder = self.folder_edit.text().strip()
-        if not folder or not os.path.isdir(folder):
-            QMessageBox.critical(self, "Error", "Please select a valid parent folder.")
+        
+        parent_folders = self.get_parent_folders()
+        if not parent_folders:
+            QMessageBox.critical(self, "Error", "Please add at least one parent folder.")
             return
+            
+        for folder in parent_folders:
+            if not os.path.isdir(folder):
+                QMessageBox.critical(self, "Error", f"Invalid parent folder:\n{folder}")
+                return
+                
         commit_msg = self.commit_edit.text().strip()
         if not commit_msg:
             QMessageBox.critical(self, "Error", "Please enter a commit message.")
             return
 
         for tool in ("git", "gh"):
-            ok, _ = self.run_cmd([tool, "--version"], cwd=folder, timeout=30, dry_run_safe=True)
+            ok, _ = self.run_cmd([tool, "--version"], cwd=parent_folders[0], timeout=30, dry_run_safe=True)
             if not ok:
                 QMessageBox.critical(self, "Error", f"'{tool}' not found in PATH.\nPlease install it and ensure it's in your PATH.")
                 return
@@ -1651,20 +1693,63 @@ class GitRepoCreatorApp(QMainWindow):
         self.report_btn.setEnabled(False)
 
         if self.reset_on_start_check.isChecked():
-            progress_file = os.path.join(folder, ".git_creator_progress.json")
-            if os.path.exists(progress_file):
-                try:
-                    os.remove(progress_file)
-                    self._log("🔄 Progress file deleted. All repositories will be reprocessed from scratch.", "warn")
-                except Exception as e:
-                    self._log(f"⚠️ Could not delete progress file: {e}", "warn")
-            else:
-                self._log("ℹ️ No progress file found. Starting fresh.", "info")
+            for folder in parent_folders:
+                progress_file = os.path.join(folder, ".git_creator_progress.json")
+                if os.path.exists(progress_file):
+                    try:
+                        os.remove(progress_file)
+                        self._log(f"🔄 Progress file deleted in {folder}.", "warn")
+                    except Exception as e:
+                        self._log(f"⚠️ Could not delete progress file in {folder}: {e}", "warn")
 
-        self._worker_thread = threading.Thread(target=self.process_folders, args=(folder, commit_msg), daemon=True)
+        # Start the master worker thread that will loop through all parent folders
+        self._worker_thread = threading.Thread(target=self._run_all_folders, args=(parent_folders, commit_msg), daemon=True)
         self._worker_thread.start()
 
-    def process_folders(self, parent_folder: str, commit_msg: str):
+    def _run_all_folders(self, parent_folders: List[str], commit_msg: str):
+        """Master loop that processes each parent folder sequentially."""
+        try:
+            # 1. Calculate total subfolders across ALL parent folders for the global progress bar
+            total_global_subfolders = 0
+            for folder in parent_folders:
+                try:
+                    subfolders = [d for d in os.listdir(folder) if os.path.isdir(os.path.join(folder, d)) 
+                                  and not d.startswith(".") and d.lower() not in self.EXCLUDE_FOLDERS 
+                                  and not d.startswith(".git_creator")]
+                    total_global_subfolders += len(subfolders)
+                except Exception: pass
+                
+            if total_global_subfolders == 0:
+                self._log("No valid subfolders found in any of the selected parent folders.", "info")
+                self._safe_emit(self.signals.finished_signal)
+                return
+
+            self.stats["total"] = total_global_subfolders
+            self._update_global_progress(0, total_global_subfolders, "", "scanning")
+            mode = "🔍 DRY-RUN MODE" if self.dry_run else "LIVE MODE"
+            threads = self.threads_spin.value()
+            self._log(f"Found {len(parent_folders)} parent folder(s) containing {total_global_subfolders} total subfolders. Processing with {threads} parallel thread(s) per folder. [{mode}]\n", "info")
+
+            # 2. Process each parent folder sequentially
+            for idx, folder in enumerate(parent_folders):
+                if self.cancelled: break
+                
+                self._log(f"\n{'='*60}\n📂 PROCESSING PARENT FOLDER {idx+1}/{len(parent_folders)}: {folder}\n{'='*60}\n", "info")
+                
+                # Process the subfolders inside this parent folder
+                self._process_single_parent_folder(folder, commit_msg, total_global_subfolders)
+                
+            # 3. Retry rate-limited repos after ALL folders are done
+            if not self.cancelled:
+                self._retry_rate_limited_repos(commit_msg)
+                
+        except Exception as e:
+            self._log(f"Critical error in master loop: {e}", "critical")
+        finally:
+            self._safe_emit(self.signals.finished_signal)
+
+    def _process_single_parent_folder(self, parent_folder: str, commit_msg: str, total_global_subfolders: int):
+        """Processes the subfolders of a single parent folder using the thread pool."""
         try:
             subfolders = sorted(
                 os.path.join(parent_folder, d)
@@ -1675,33 +1760,21 @@ class GitRepoCreatorApp(QMainWindow):
                 and not d.startswith(".git_creator")
             )
         except Exception as e:
-            self._log(f"Failed to list subfolders: {e}", "fail")
-            self._safe_emit(self.signals.finished_signal)
+            self._log(f"Failed to list subfolders in {parent_folder}: {e}", "fail")
             return
 
         if not subfolders:
-            self._log("No valid subfolders found.", "info")
-            self._safe_emit(self.signals.finished_signal)
+            self._log(f"No valid subfolders found in {parent_folder}.", "info")
             return
 
         resumed = self._load_progress(parent_folder)
         if resumed and self.completed_repos:
-            self._log(f"Resuming: {len(self.completed_repos)} repo(s) already completed. Skipping them.\n", "info")
-
-        total = len(subfolders)
-        self.stats["total"] = total
-        self._update_global_progress(0, total, "", "scanning")
-        mode = "🔍 DRY-RUN MODE — no changes will be made" if self.dry_run else "LIVE MODE"
-        threads = self.threads_spin.value()
-        self._log(f"Found {total} subfolders. Processing with {threads} parallel thread(s). [{mode}]\n", "info")
+            self._log(f"Resuming: {len(self.completed_repos)} repo(s) already completed in this folder. Skipping them.\n", "info")
 
         visibility = self.visibility_combo.currentText()
-        completed_count = 0
-        completed_lock = threading.Lock()
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.threads_spin.value())
 
         def process_single(sf: str):
-            nonlocal completed_count
             name = os.path.basename(sf)
             self._thread_local.current_repo = name
 
@@ -1715,10 +1788,8 @@ class GitRepoCreatorApp(QMainWindow):
                     with self.stats_lock:
                         self.stats["skipped"] += 1
                         self.stats["processed"] += 1
-                    with completed_lock:
-                        completed_count += 1
-                    self._safe_emit(self.signals.progress_signal, self.stats["processed"], self.stats["total"], name)
-                    self._update_global_progress(self.stats["processed"], self.stats["total"], name, "skipped")
+                    self._safe_emit(self.signals.progress_signal, self.stats["processed"], total_global_subfolders, name)
+                    self._update_global_progress(self.stats["processed"], total_global_subfolders, name, "skipped")
                     return None
 
                 gh_name = self._sanitize_repo_name(name)
@@ -1727,7 +1798,7 @@ class GitRepoCreatorApp(QMainWindow):
 
                 self._log(f"--- Starting processing ---", "info")
                 self._safe_emit(self.signals.repo_start_signal, name)
-                self._update_global_progress(self.stats["processed"], self.stats["total"], name, "processing")
+                self._update_global_progress(self.stats["processed"], total_global_subfolders, name, "processing")
 
                 size_before = self._analyze_repo_size(sf)
                 has_git = os.path.isdir(os.path.join(sf, ".git"))
@@ -1746,7 +1817,7 @@ class GitRepoCreatorApp(QMainWindow):
                     self.stats["processed"] += 1
                     if ok:
                         self.stats[action] += 1
-                        if not self.dry_run: self._save_progress(name)
+                        if not self.dry_run: self._save_progress(name, parent_folder)
                     else:
                         with self._rate_limited_lock:
                             is_rate_limited = any(r["gh_name"] == gh_name for r in self._rate_limited_repos)
@@ -1755,14 +1826,12 @@ class GitRepoCreatorApp(QMainWindow):
                             self.stats["errors"].append({"repo": name, "action": action})
 
                 self._safe_emit(self.signals.repo_done_signal, name, ok)
-                with completed_lock:
-                    completed_count += 1
-                self._safe_emit(self.signals.progress_signal, self.stats["processed"], self.stats["total"], name)
+                self._safe_emit(self.signals.progress_signal, self.stats["processed"], total_global_subfolders, name)
 
                 with self._rate_limited_lock:
                     is_rate_limited = any(r["gh_name"] == gh_name for r in self._rate_limited_repos)
                 status = "completed" if ok else ("deferred" if is_rate_limited else "failed")
-                self._update_global_progress(self.stats["processed"], self.stats["total"], name, status)
+                self._update_global_progress(self.stats["processed"], total_global_subfolders, name, status)
                 self._safe_emit(self.signals.stats_signal, f"Done: {self.stats['created']} created | {self.stats['updated']} updated | {self.stats['failed']} failed | {len(self._rate_limited_repos)} deferred | {self.stats['skipped']} skipped")
 
                 thread_id = self._get_thread_id()
@@ -1794,10 +1863,6 @@ class GitRepoCreatorApp(QMainWindow):
                     break
         finally:
             self._executor.shutdown(wait=True)
-
-        if not self.cancelled:
-            self._retry_rate_limited_repos(commit_msg)
-        self._safe_emit(self.signals.finished_signal)
 
     def _retry_rate_limited_repos(self, commit_msg: str):
         if not self._rate_limited_repos: return
@@ -1831,7 +1896,7 @@ class GitRepoCreatorApp(QMainWindow):
                     with self.stats_lock:
                         self.stats["created"] += 1
                         self.stats["errors"] = [e for e in self.stats["errors"] if e.get("repo") != gh_name]
-                    if not self.dry_run: self._save_progress(gh_name)
+                    if not self.dry_run: self._save_progress(gh_name, os.path.dirname(sf))
                 elif "too many repositories" in (err or "").lower() or "rate limit" in (err or "").lower() or "try again later" in (err or "").lower():
                     self._log(f"  ⏳ Still rate limited. Deferring for next round...", "warn")
                     with self._rate_limited_lock:
@@ -1865,17 +1930,18 @@ class GitRepoCreatorApp(QMainWindow):
             except Exception: pass
         return False
 
-    def _save_progress(self, repo_name: str):
+    def _save_progress(self, repo_name: str, parent_folder: str):
+        progress_file = os.path.join(parent_folder, ".git_creator_progress.json")
         with self.progress_lock:
             self.completed_repos.add(repo_name)
             data = {"completed": sorted(self.completed_repos), "updated_at": datetime.now().isoformat()}
             try:
-                dir_name = os.path.dirname(self.progress_file)
+                dir_name = os.path.dirname(progress_file)
                 fd, temp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
-                    if os.path.exists(self.progress_file): os.remove(self.progress_file)
-                    os.rename(temp_path, self.progress_file)
+                    if os.path.exists(progress_file): os.remove(progress_file)
+                    os.rename(temp_path, progress_file)
                 except Exception:
                     try: os.remove(temp_path)
                     except Exception: pass
@@ -2006,10 +2072,6 @@ class GitRepoCreatorApp(QMainWindow):
 
     def clear_log(self):
         self.log_output.clear()
-
-    def browse_folder(self):
-        f = QFileDialog.getExistingDirectory(self, "Select Parent Folder")
-        if f: self.folder_edit.setText(f)
 
     def open_log_file(self):
         log_file_path = os.path.join(os.getcwd(), "git_creator_run.log")
@@ -2218,9 +2280,10 @@ class GitRepoCreatorApp(QMainWindow):
                 self._active_processes.clear()
 
     def export_report(self):
-        folder = self.folder_edit.text().strip()
-        if not folder: return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Report", os.path.join(folder, "git_creator_report.json"), "JSON Files (*.json);;All Files (*)")
+        folders = self.get_parent_folders()
+        if not folders: return
+        default_name = "git_creator_report.json"
+        path, _ = QFileDialog.getSaveFileName(self, "Save Report", os.path.join(folders[0], default_name), "JSON Files (*.json);;All Files (*)")
         if not path: return
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -2318,6 +2381,6 @@ if __name__ == "__main__":
     app.setPalette(palette)
     
     window = GitRepoCreatorApp()
-    app.window = window  # For the logger formatter
+    app.window = window
     window.show()
     sys.exit(app.exec())
